@@ -632,7 +632,7 @@ dtb-$(CONFIG_MACH_SUN50I_H5) += \
 	sun50i-h5-nanopi-neo2.dtb \
 	sun50i-h5-nanopi-neo-core2.dtb \
 	sun50i-h5-nanopi-neo-plus2.dtb \
-	sun50i-h5-orangepi-zero-plus.dtb \
+	sun50i-h5-orangepi-zero-plus.dtb\ \
 	sun50i-h5-orangepi-pc2.dtb \
 	sun50i-h5-nanopi-k1-plus.dtb \
 	sun50i-h5-orangepi-prime.dtb \
@@ -650,7 +650,8 @@ dtb-$(CONFIG_MACH_SUN50I_H616) += \
 	sun50i-h616-orangepi-zero2-b.dtb \
 	sun50i-h616-orangepi-zero2-lts.dtb \
 	sun50i-h616-orangepi-zero3.dtb \
-	sun50i-h616-orangepi-zero2w.dtb
+	sun50i-h616-orangepi-zero2w.dtb \
+	sun50i-h616-orangepi-zero2w-beepy.dtb
 dtb-$(CONFIG_MACH_SUN50I) += \
 	sun50i-a64-amarula-relic.dtb \
 	sun50i-a64-bananapi-m64.dtb \
