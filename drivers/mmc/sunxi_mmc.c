@@ -99,23 +99,33 @@ static int mmc_resource_init(int sdc_no)
 }
 #endif
 
+#ifndef CCM_MMC_CTRL_MODE_SEL_NEW
+#define CCM_MMC_CTRL_MODE_SEL_NEW	0
+#endif
+
+/*
+ * All A64 and later MMC controllers feature auto-calibration. This would
+ * normally be detected via the compatible string, but we need something
+ * which works in the SPL as well.
+ */
+static bool sunxi_mmc_can_calibrate(void)
+{
+	return IS_ENABLED(CONFIG_MACH_SUN50I) ||
+	       IS_ENABLED(CONFIG_MACH_SUN50I_H5) ||
+	       IS_ENABLED(CONFIG_SUN50I_GEN_H6) ||
+	       IS_ENABLED(CONFIG_SUNXI_GEN_NCAT2) ||
+	       IS_ENABLED(CONFIG_MACH_SUN8I_R40);
+}
+
 static int mmc_set_mod_clk(struct sunxi_mmc_priv *priv, unsigned int hz)
 {
 	unsigned int pll, pll_hz, div, n, oclk_dly, sclk_dly;
-	bool new_mode = true;
-	bool calibrate = false;
+	bool new_mode = IS_ENABLED(CONFIG_MMC_SUNXI_HAS_NEW_MODE);
 	u32 val = 0;
-
-	if (!IS_ENABLED(CONFIG_MMC_SUNXI_HAS_NEW_MODE))
-		new_mode = false;
 
 	/* A83T support new mode only on eMMC */
 	if (IS_ENABLED(CONFIG_MACH_SUN8I_A83T) && priv->mmc_no != 2)
 		new_mode = false;
-
-#if defined(CONFIG_MACH_SUN50I) || defined(CONFIG_SUN50I_GEN_H6)
-	calibrate = true;
-#endif
 
 	if (hz <= 24000000) {
 		pll = CCM_MMC_CTRL_OSCM24;
@@ -124,11 +134,15 @@ static int mmc_set_mod_clk(struct sunxi_mmc_priv *priv, unsigned int hz)
 #ifdef CONFIG_MACH_SUN9I
 		pll = CCM_MMC_CTRL_PLL_PERIPH0;
 		pll_hz = clock_get_pll4_periph0();
-#elif defined(CONFIG_SUN50I_GEN_H6)
-		pll = CCM_MMC_CTRL_PLL6X2;
-		pll_hz = clock_get_pll6() * 2;
 #else
-		pll = CCM_MMC_CTRL_PLL6;
+		/*
+		 * SoCs since the A64 (H5, H6, H616) actually use the doubled
+		 * rate of PLL6/PERIPH0 as an input clock, but compensate for
+		 * that with a fixed post-divider of 2 in the mod clock.
+		 * This cancels each other out, so for simplicity we just
+		 * pretend it's always PLL6 without a post divider here.
+		 */
+		pll = CCM_MMC_CTRL_PLL6X2;
 		pll_hz = clock_get_pll6();
 #endif
 	}
@@ -156,33 +170,27 @@ static int mmc_set_mod_clk(struct sunxi_mmc_priv *priv, unsigned int hz)
 	} else if (hz <= 25000000) {
 		oclk_dly = 0;
 		sclk_dly = 5;
-#ifdef CONFIG_MACH_SUN9I
-	} else if (hz <= 52000000) {
-		oclk_dly = 5;
-		sclk_dly = 4;
 	} else {
-		/* hz > 52000000 */
-		oclk_dly = 2;
+		if (IS_ENABLED(CONFIG_MACH_SUN9I)) {
+			if (hz <= 52000000)
+				oclk_dly = 5;
+			else
+				oclk_dly = 2;
+		} else {
+			if (hz <= 52000000)
+				oclk_dly = 3;
+			else
+				oclk_dly = 1;
+		}
 		sclk_dly = 4;
-#else
-	} else if (hz <= 52000000) {
-		oclk_dly = 3;
-		sclk_dly = 4;
-	} else {
-		/* hz > 52000000 */
-		oclk_dly = 1;
-		sclk_dly = 4;
-#endif
 	}
 
 	if (new_mode) {
-#ifdef CONFIG_MMC_SUNXI_HAS_NEW_MODE
-#ifdef CONFIG_MMC_SUNXI_HAS_MODE_SWITCH
-		val = CCM_MMC_CTRL_MODE_SEL_NEW;
-#endif
+		val |= CCM_MMC_CTRL_MODE_SEL_NEW;
 		setbits_le32(&priv->reg->ntsr, SUNXI_MMC_NTSR_MODE_SEL_NEW);
-#endif
-	} else if (!calibrate) {
+	}
+
+	if (!sunxi_mmc_can_calibrate()) {
 		/*
 		 * Use hardcoded delay values if controller doesn't support
 		 * calibration
@@ -294,6 +302,7 @@ static int sunxi_mmc_core_init(struct mmc *mmc)
 	return 0;
 }
 #endif
+#define SUNXI_MMC_STATUS_FIFO_LEVEL(reg)	(((reg) >> 17) & 0x3fff)
 
 static int mmc_trans_data_by_cpu(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 				 struct mmc_data *data)
@@ -303,8 +312,9 @@ static int mmc_trans_data_by_cpu(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 					      SUNXI_MMC_STATUS_FIFO_FULL;
 	unsigned i;
 	unsigned *buff = (unsigned int *)(reading ? data->dest : data->src);
-	unsigned byte_cnt = data->blocksize * data->blocks;
-	unsigned timeout_msecs = byte_cnt >> 8;
+	unsigned word_cnt = (data->blocksize * data->blocks) >> 2;
+	unsigned timeout_msecs = word_cnt >> 6;
+	uint32_t status;
 	unsigned long  start;
 
 	if (timeout_msecs < 2000)
@@ -315,20 +325,47 @@ static int mmc_trans_data_by_cpu(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 
 	start = get_timer(0);
 
-	for (i = 0; i < (byte_cnt >> 2); i++) {
-		while (readl(&priv->reg->status) & status_bit) {
+	for (i = 0; i < word_cnt;) {
+		unsigned int in_fifo;
+
+		while ((status = readl(&priv->reg->status)) & status_bit) {
 			if (get_timer(start) > timeout_msecs)
 				return -1;
 		}
 
-		if (reading)
-			buff[i] = readl(&priv->reg->fifo);
-		else
-			writel(buff[i], &priv->reg->fifo);
+		/*
+		 * For writing we do not easily know the FIFO size, so have
+		 * to check the FIFO status after every word written.
+		 * TODO: For optimisation we could work out a minimum FIFO
+		 * size across all SoCs, and use that together with the current
+		 * fill level to write chunks of words.
+		 */
+		if (!reading) {
+			writel(buff[i++], &priv->reg->fifo);
+			continue;
+		}
+
+		/*
+		 * The status register holds the current FIFO level, so we
+		 * can be sure to collect as many words from the FIFO
+		 * register without checking the status register after every
+		 * read. That saves half of the costly MMIO reads, effectively
+		 * doubling the read performance.
+		 * Some SoCs (A20) report a level of 0 if the FIFO is
+		 * completely full (value masked out?). Use a safe minimal
+		 * FIFO size in this case.
+		 */
+		in_fifo = SUNXI_MMC_STATUS_FIFO_LEVEL(status);
+		if (in_fifo == 0 && (status & SUNXI_MMC_STATUS_FIFO_FULL))
+			in_fifo = 32;
+		for (; in_fifo > 0; in_fifo--)
+			buff[i++] = readl_relaxed(&priv->reg->fifo);
+		dmb();
 	}
 
 	return 0;
 }
+
 
 static int mmc_rint_wait(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 			 uint timeout_msecs, uint done_bit, const char *what)
